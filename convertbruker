@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+#
+# developed at /home/sneumann/src/convertbruker/
+# $Id: convertbruker,v 1.21 2020/10/13 19:14:56 sneumann Exp sneumann $
+# $Log: convertbruker,v $
+# Revision 1.21  2020/10/13 19:14:56  sneumann
+# *** empty log message ***
+#
+# Revision 1.20  2020/10/13 12:28:35  sneumann
+# *** empty log message ***
+#
+# Revision 1.19  2017/03/02 22:38:31  sneumann
+# Fix registry display for Calibraion, experimentally add call to mzml2isa (disabled by default)
+#
+# Revision 1.18  2017/03/02 21:32:31  sneumann
+# Switch to mzML by default, use new CXP now
+#
+# Revision 1.17  2012/07/20 11:32:23  sneumann
+# add (no) options, add enhancedmsms handling
+#
+# Revision 1.16  2012/07/19 13:38:12  sneumann
+# erste Version des nocalibrate implementiert. Vorsicht: regedit /E Ausgabe ist fehlerhaft ?
+#
+# Revision 1.15 2012/07/04 ckuhl
+# Changed argument processing
+# Revision 1.14  2012/05/02 10:25:31  sneumann
+# *** empty log message ***
+#
+# Revision 1.13  2011/12/15 14:46:56  sneumann
+# added express and office queue
+#
+# Revision 1.12  2011/12/15 14:44:06  sneumann
+# *** empty log message ***
+#
+# Revision 1.11  2011/06/30 07:45:07  sneumann
+# Added (and checked) support for FTICR fid files
+#
+# Revision 1.10  2011/03/11 11:39:20  sneumann
+# fix jobname for files with leading digits
+#
+# Revision 1.9  2010/11/02 20:56:12  sneumann
+# fixed another place where input filenames with space in the name was a problem
+#
+# Revision 1.8  2010/09/13 09:22:21  sneumann
+# Added RCS expansion
+# 
+
+function usage() {
+echo "NAME
+	convertbruker - convert bruker raw file into open file format
+
+SYNOPSIS
+        Usage : convertbruker  [--[no]calibrate] [--[no]enhancedMSMS]
+                               [-q, --queue queuename] [-s, --singularity]
+			       [-m, --mode modus] [-o, --outdir] FOLDER/FILELIST
+
+		convertbruker [-h, --help]
+
+DESCRIPTION
+        Convert all bruker file in FOLDER to $SUFFIX (Centroid Mode) 
+        where FOLDER contains Bruker sample directories (! not nested !).
+
+        FILELIST is any number of Analysis.baf files (i.e. no directories!)
+ 
+        Results will be deposited in a $SUFFIX directory just next 
+        to the Bruker sample directory. Make sure that FOLDER is writeable !
+        Alternatively, an output directory can be specified via --outdir.
+        Logs will be written to the sge folder, it can be removed afterwards.
+
+        There is also experimental support to extract ISA-Tab information 
+        from the mzML files.
+
+	There is experimental support to run the conversion inside a singularity 
+        runtime environment. 
+
+OPTIONS
+	--[no]calibrate 
+		Do [not] use calibration. Calibration data needs to be
+                present in the raw data 
+
+	--[no]enhancedMSMS
+                Do [not] use enhanced MSMS
+
+	-m, --mode 
+		Convertion modus. Allowed values are mzData, mzXML, mzML (default), JCAMP and CSV
+
+     	-q, --queue 
+		Gridengine queue names. Allowed values are MSBI, MSBIexpress, MSBIoffice, MSBIofficeexpress
+
+	-o, --outdir DIR
+                Place output in this folder 
+
+	-s, --singularity
+                Use a singularity container 
+
+	-h, --help 
+		Print this help
+ 
+EXAMPLES
+        tbd."
+}
+
+MODE="mzML"
+QUEUE="LOCAL"
+GRIDENGINE="disabled"
+USESINGULARITY=false
+
+CALIBRATION=true
+ENHANCEDMSMS=true
+
+IMAGE=/vol/kubernetes/Singularity/images/sneumann_compassxport_3092-0.2-2019-05-28-e6c4157ba445.simg
+
+if ! options=$(getopt -o q:o:m:s:h -l queue:,outdir:,mode,singularity,help,calibrate,nocalibrate,enhancedmsms,noenhancedmsms -- "$@")
+then
+    # something went wrong, getopt will put out an error message for us
+    exit 1
+fi
+
+set -- $options
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h|--help)
+            usage
+            exit;;
+        -q|--queue)
+            QUEUE=${2//\'/}; shift;;
+        -o|--outdir)
+            OUTDIR="${2//\'/}"; shift;;
+        -s|--singularity)
+            USESINGULARITY=true;;
+        -m|--mode)
+            MODE=${2//\'/}; shift;;
+	--calibrate)
+	   CALIBRATION=true;;
+	--nocalibrate)
+	   CALIBRATION=false;; 
+	--enhancedmsms)
+	   ENHANCEDMSMS=true;;
+	--noenhancedmsms)
+	   ENHANCEDMSMS=false;;
+	(--) shift; break;;
+	(-*) echo "$0: error - unrecognized option $1" 1>&2; exit 1;;
+	
+        *) break;;
+    esac
+shift
+done
+
+if test $#  = 0; then
+	echo "convertbruker requires a file- or foldername"
+	exit 0
+fi
+
+# Check MODE
+# @ckuhl
+# allowed values are mzXML, mzData, mzML, JCAMP, CSV
+declare -A MODES
+MODES=( ["mzXML"]=0 ["mzData"]=1 ["mzML"]=2 ["JCAMP"]=3 ["CSV"]=4 )
+
+if test ${MODES[$MODE]+_}; then
+	SUFFIX=$MODE
+else
+	echo "Invalid parameter mode"
+	exit 1
+fi
+
+#
+# Check Queue modus
+# @ckuhl
+# allowed values are MSBI, MSBIexpress, MSBIoffice
+# Check first of local run
+if [ $QUEUE = "LOCAL" ] ; then
+	echo "Use of Gridengine disabled, running locally" 
+else
+	declare -A QUEUES
+	QUEUES=(["1804.q"]=1 ["1804.q@u1804sge-1.ipb-halle.de"]=1 ["2004.q"]=1)
+	if test ${QUEUES[$QUEUE]+_}; then
+		GRIDENGINE="enabled"
+		echo "Useing of Gridengine queue $QUEUE"
+	else
+		echo "Unknown Gridengine queue"
+		exit 2
+	fi
+fi
+
+#
+# Check Singularity stuff
+# @sneumann
+
+# Check first of local run
+if [ "$USESINGULARITY" == "disabled" ] ; then
+	echo "Use of Singularity disabled, assuming compassxport is installed" 
+else
+	echo "Enabled use of Singularity"
+fi
+
+##
+## Make sure to handle files with spaces
+##
+SAVEIFS=$IFS
+IFS=$(echo -en "\n\b")
+
+ARG=${1//\'/}
+
+if [ -d "$ARG" ] ; then 
+    ## Argument is a directory, collect files to convert 
+    if [ $# -gt 1 ] ; then 
+	echo "WARNING: multiple arguments given, only using files in $ARG !"
+    fi
+    DIR="$(cd "$ARG" ; /bin/pwd)"
+    BAFFILES=($(find -L "$DIR" -maxdepth 2 -name 'analysis.baf'  -exec readlink -f \{\} \; ))
+    FIDFILES=($(find -L "$DIR" -maxdepth 4  -name 'fid'  -exec readlink -f \{\} \; ))
+#    BAFFILES=($(find -L "$DIR" -maxdepth 2 -name 'analysis.baf'))
+#    FIDFILES=($(find -L "$DIR" -maxdepth 4  -name 'fid'))
+    U2FILES=() # $(find -L "$DIR" -maxdepth 2  -name '*.u2'))
+    FILES=(${BAFFILES[@]} ${FIDFILES[@]} ${U2FILES[@]})
+    SGEDIR="$DIR/SGE"
+    if [ "X$OUTDIR" == "X" ] ; then 
+      OUTDIR="$DIR/$SUFFIX"
+    fi
+else 
+    i=0
+    for FILE in "$@" ; do
+	FILE=${FILE//\'/}
+	if [ ! "${FILE:0:1}" = "/" ] ; then 
+	    # Add absolute path
+	    FILE="$PWD"/"$FILE"
+	fi
+        # Paranoid checks
+	if [ ! -r "$FILE" ] ; then	    
+	    echo "WARNING: "$FILE" is not a readable file, exiting !"
+	    exit 1;
+	else
+	    FILES[q$i]="$FILE"
+	    i=$(($i+1))
+	fi
+    done 
+
+    SGEDIR="$PWD/SGE"
+    if [ "X$OUTDIR" == "X" ] ; then 
+      OUTDIR="$DIR/$SUFFIX"
+    fi
+fi
+
+##
+## Restore space handling
+##
+IFS=$SAVEIFS
+
+mkdir -p -m 750 "$SGEDIR" 
+if [ ! -w "$SGEDIR" ] ; then
+    echo "$SGEDIR" is not writable. Exiting.
+#    This test gives a false negative for Isilon NFS4 directories
+#    exit;
+fi
+
+mkdir -p -m 750 "$OUTDIR"
+if [ ! -w "$OUTDIR" ] ; then
+    echo "$OUTDIR" is not writable. Exiting.
+#    This test gives a false negative for Isilon NFS4 directories
+#    exit;
+fi
+
+echo "Got ${#FILES[@]} files"
+echo Will convert into "$OUTDIR"
+echo Logfiles go into "$SGEDIR"
+
+##
+## Start xvfb
+##
+# http://mojo.codehaus.org/selenium-maven-plugin/examples/headless-with-xvfb.html
+# https://bugs.launchpad.net/ubuntu/+source/xorg-server/+bug/294454
+
+##
+## Wine stuff and diagnostics
+##
+
+export WINEDEBUG=fixme-all
+
+## NO TRAILING SLASH!
+export WINEPREFIX=/tmp/msbiwine-$USER
+export GLOBALWINEPREFIX=/vol/data/lcms/convert.tools/dot.wine.global.cxp3092
+
+#
+# Check setup ".wine" directory
+#
+
+mkdir -p "$WINEPREFIX"
+cp -v "$GLOBALWINEPREFIX"/*.reg "$WINEPREFIX"
+cp -avx "$GLOBALWINEPREFIX/dosdevices" "$WINEPREFIX"
+
+CXP="$GLOBALWINEPREFIX/global_drive_c/Program Files/Bruker Daltonik/CompassXport/CompassXport.exe"
+
+echo Using $CXP
+
+##
+## enable/disable calibration
+##
+
+#if [ $CALIBRATION = false ] ; then
+#    echo "Disable calibration in CompassXport"   
+#    wine regedit "$GLOBALWINEPREFIX/recalibrated_off.reg"
+#else
+#    echo "Enable calibration in CompassXport"   
+#    wine regedit "$GLOBALWINEPREFIX/recalibrated_on.reg"
+#fi
+
+##
+## enable/disable enhancedMSMS
+##
+
+#if [ $ENHANCEDMSMS = false ] ; then
+#    echo "Disable enhanced MS/MS in CompassXport"   
+#    wine regedit "$GLOBALWINEPREFIX/enhanced_off.reg"
+#else
+#    echo "Enable enhanced MS/MS in CompassXport"   
+#    wine regedit "$GLOBALWINEPREFIX/enhanced_on.reg"
+#fi
+
+
+##
+## Show Regsitry settings
+##
+
+echo Registry settings are:
+
+#wine regedit /E - 'HKEY_CURRENT_USER\Software\Bruker Daltonik\CompassXport'|\
+#  grep = |\
+#  sed -e 's/\(\)=[^01]*\([01]*\).*/\1 = \2/' |\
+#  sed -e 's/00000001/enabled/' |\
+#  sed -e 's/00000000/disabled/' 
+
+##
+## Make sure to handle files with spaces
+##
+SAVEIFS=$IFS
+IFS=$(echo -en "\n\b")
+
+echo "GRIDENGINE is $GRIDENGINE"
+
+echo "Creating conversion jobs: "
+for FILE in "${FILES[@]}" ; do 
+    case $FILE in
+	*.baf)
+	    SAMPLE=$(echo $FILE | sed -e 's#.*/\(.*\).d/analysis.baf$#\1#')
+	    ;;
+	*/fid)
+	    SAMPLE=$(echo $FILE | sed -e 's#.*/\(.*\)/\([0-9]*\)/fid$#\1-Exp\2#') 
+	    ;;
+	*.u2)
+	    SAMPLE=$(echo $FILE | sed -e 's#.*/\(.*\).d/.*\.u2$#\1#')
+	    ;;
+	*)   
+	    echo "That file type is not recognized"
+	    ;;
+    esac 
+
+    JOBFILE=$SGEDIR/$SAMPLE.sh
+
+    ## Touch this, so we capture failled jobs
+    touch "$OUTDIR/$SAMPLE.$SUFFIX.CORRUPT"
+
+    if [ -r $FILE -a \( ! -f $JOBFILE -o -w $JOBFILE \) ] ; then
+	cat >$JOBFILE <<EOF
+#!/bin/bash
+#
+# Set the name of the job.
+#$ -N "CXP-$SAMPLE"
+#
+# Make sure that the .e and .o file arrive in the 
+# SGE directory
+#$ -e "$SGEDIR"
+#$ -o "$SGEDIR"
+#Merge the standard out and standard error to one file
+#$ -j y 
+#
+# My code is re-runnable
+#$ -r y
+# 
+# Use priority queue
+#$ -q $QUEUE
+#$ -pe smp 6
+
+# Cleanup potential previous file.CORRUPT 
+# Create empty dummy, which is known to *not* validate 
+rm -f "$OUTDIR/$SAMPLE.$SUFFIX.CORRUPT"
+#touch "$OUTDIR/$SAMPLE.$SUFFIX"
+
+
+if /bin/true ; then ## RUN UNDER SINGULARITY
+  TMPMYWINEPREFIX=\$(mktemp -d /dev/shm/wineXXX)
+  CXP="/wineprefix/drive_c/Program Files/Bruker Daltonik/CompassXport/CompassXport.exe"
+  INDIR="\$(dirname "$FILE")"
+  INPARENT="\$(dirname "\$INDIR")"
+  INLEAF="\$(basename "\$INDIR")"
+  INFILE="\$(basename "$FILE")"
+
+  echo singularity exec \
+    -B "\$INPARENT":/in \
+    -B "$OUTDIR":/out \
+    -B "\$TMPMYWINEPREFIX":/mywineprefix \
+    --writable-tmpfs \
+    "$IMAGE" \
+    xvfb-run -a mywine "\$CXP" -a "z:/in/\$INLEAF/\$INFILE" -o "z:/out/$SAMPLE.$SUFFIX" -mode ${MODES[$MODE]} -raw 0
+
+  singularity exec \
+    -B "\$INPARENT":/in \
+    -B "$OUTDIR":/out \
+    -B "\$TMPMYWINEPREFIX":/mywineprefix \
+    --writable-tmpfs \
+    "$IMAGE" \
+    xvfb-run -a mywine "\$CXP" -a "z:/in/\$INLEAF/\$INFILE" -o "z:/out/$SAMPLE.$SUFFIX" -mode ${MODES[$MODE]} -raw 0
+
+   sleep 20 
+
+fi
+
+
+if /bin/false ; then ## RUN UNDER WINE
+  #
+  # Check and setup .wine directory
+  # If not running under SGE, WINEPREFIX is already set 
+  # by convertbruker script
+  # 
+  if [ ! -z "\$JOB_ID" ] ; then 
+    ## Running under SGE
+    export WINEPREFIX="$WINEPREFIX".\$HOSTNAME.\$JOB_ID
+    mkdir -p "\$WINEPREFIX"
+    cp -v "$GLOBALWINEPREFIX"/*.reg "\$WINEPREFIX"
+    cp -avx "$GLOBALWINEPREFIX/dosdevices" "\$WINEPREFIX"
+  fi
+
+  export GLOBALWINEPREFIX="$GLOBALWINEPREFIX"
+  export WINEDEBUG=fixme-all
+
+  # run via wine
+  xvfb-run -a wine "$CXP" -a "$FILE" -o "$OUTDIR/$SAMPLE.$SUFFIX" -mode ${MODES[$MODE]} \
+    || echo "XVFB: Error code \$?"
+
+  #
+  # Cleanup .wine directory
+  #
+
+  if [ ! -z "\$JOB_ID" ] ; then 
+    ## Running under SGE
+    rm -rf "$WINEPREFIX".\$HOSTNAME.\$JOB_ID
+  fi
+fi ## RUN UNDER WINE
+
+#
+# Double-check results
+#
+
+VALID="false"
+
+xmllint --noout "$OUTDIR/$SAMPLE.$SUFFIX"
+
+if [ ! -z "$OUTDIR/$SAMPLE.$SUFFIX" -a "\$?" = "0" ] ; then 
+   echo "XML Verified fine"
+   VALID="true"
+elif [ ! -z "$OUTDIR/$SAMPLE.$SUFFIX" -a "\$?" = "1" ] ; then 
+   # possible cause is huuuge XML nodes, e.g. direct infusion FTICR
+   # Just do *very simple* test for last line.
+   if egrep '</mzXML>|</mzData>|</mzML>' "$OUTDIR/$SAMPLE.$SUFFIX" ; then
+      echo "$OUTDIR/$SAMPLE.$SUFFIX heuristic XML validation OK."
+      VALID="true"
+   fi 
+fi
+
+sync
+
+if [ "\$VALID" = "false" ] ; then 
+   echo "$OUTDIR/$SAMPLE.$SUFFIX XML VERIFICATION ERROR !!!"
+
+   # Better a corrupt file than no file!
+   # disabled for debugging
+   echo mv "$OUTDIR/$SAMPLE.$SUFFIX" "$OUTDIR/$SAMPLE.$SUFFIX.CORRUPT"
+
+   exit 1
+fi
+
+exit 0
+EOF
+	chmod +x "$JOBFILE"
+
+	if [ "$GRIDENGINE" = "enabled" ] ; then 
+            # Temporarily disable submitting
+	    JOB=$(qsub -terse "$JOBFILE")
+       	    JOBS="$JOB,$JOBS"
+	    echo -n .
+	else
+	    echo Executing "$JOBFILE"
+	    bash "$JOBFILE"
+	    RETCODE=$?
+	    if [ "$RETCODE" != "0" ] ; then
+		echo "Something  ($RETCODE) wrong in job : "$JOBFILE", trying again:"
+		bash "$JOBFILE"
+            fi
+	fi
+    else 
+	echo "WARNING: "$FILE" is not readable or "$JOBFILE" not writable, skipping"
+    fi
+done
+echo ; echo "done."
+
+##
+## Restore space handling
+##
+IFS=$SAVEIFS
+
+##
+## Watch progress
+##
+
+#if [ "$GRIDENGINE" = "enabled" ] ; then 
+#    sleep 5 
+#    watch qstat -f -q $QUEUE
+#fi
+
+##
+## If serial mode, write when finished
+##
+if [ ! "$GRIDENGINE" = "enabled" ] ; then 
+    date > $OUTDIR/done
+fi
+
+##
+## Automagically call mzml2isa
+##
+
+if [ "$ISATAB" = "enabled" -a "$MODE" = "mzML" -a "$DIR" != "" ] ; then
+    export MZML2ISA="/usr/local/bin/mzml2isa"
+    export ISADIR="$DIR/ISA-Tab"
+    if [ -x "$MZML2ISA" ] ; then
+	mkdir -p "$ISADIR"
+	$MZML2ISA -i "$OUTDIR" -o "$ISADIR" -s "$(basename $DIR)"
+    fi
+fi

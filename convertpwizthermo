@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+#
+# developed at /home/sneumann/src/...
+# 
+
+#export IMAGE=/vol/kubernetes/Singularity/images/chambm_pwiz-skyline-i-agree-to-the-vendor-licenses-2019-05-23-1c92fb5c2527.simg
+export IMAGE=/vol/kubernetes/Singularity/images/chambm_pwiz-skyline-i-agree-to-the-vendor-licenses_latest-2021-12-20-6f69007aada8.simg
+
+export MSCONVERTOPTS="--32 --zlib --filter \"peakPicking true 1-\" --filter \"zeroSamples removeExtra\""
+
+function usage() {
+echo "NAME
+	convertXXX - convert XXX into open file format
+
+SYNOPSIS
+        Usage : convertpwiz    [--[no]calibrate] [--[no]enhancedMSMS]
+                               [-q, --queue queuename] [-m, --mode modus] FOLDER/FILE LIST
+
+		convertbruker [-h, --help]
+
+DESCRIPTION
+        Convert all bruker file in FOLDER to $SUFFIX (Centroid Mode) 
+        where FOLDER contains Bruker sample directories (! not nested !).
+
+        FILELIST is any number of Analysis.baf files (i.e. no directories!)
+ 
+        Results will be deposited in a $SUFFIX directory just next 
+        to the Bruker sample directory. Make sure that FOLDER is writeable !
+        Logs will be written to the sge folder, it can be removed afterwards.
+
+        There is also experimental support to extract ISA-Tab information 
+        from the mzML files.
+
+OPTIONS
+	-m, --mode 
+		Convertion modus. Allowed values are mzData, mzXML, mzML (default), JCAMP and CSV
+
+     	-q, --queue 
+		Gridengine queue names. Allowed values are MSBI, MSBIexpress, MSBIoffice, MSBIofficeexpress
+	-h, --help 
+		Print this help
+ 
+EXAMPLES
+        tbd."
+}
+
+if ! options=$(getopt -o q:m:h -l queue:,mode,help -- "$@")
+then
+    # something went wrong, getopt will put out an error message for us
+    exit 1
+fi
+
+set -- $options
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h|--help)
+            usage
+            exit;;
+        -q|--queue)
+            QUEUE=${2//\'/}; shift;;
+        -m|--mode)
+            MODE=${2//\'/}; shift;;
+	(--) shift; break;;
+	(-*) echo "$0: error - unrecognized option $1" 1>&2; exit 1;;
+	
+        *) break;;
+    esac
+shift
+done
+
+if test $#  = 0; then
+	echo "convertbruker requires a file- or foldername"
+	exit 0
+fi
+
+##
+## 
+##
+echo "At some stage I always got errors UNLESS run as sudo convertpwizXXX "
+echo "At some stage I always got errors UNLESS run as sudo convertpwizXXX "
+echo "At some stage I always got errors UNLESS run as sudo convertpwizXXX "
+echo "At some stage I always got errors UNLESS run as sudo convertpwizXXX "
+
+##
+## Make sure to handle files with spaces
+##
+SAVEIFS=$IFS
+IFS=$(echo -en "\n\b")
+
+ARG=${1//\'/}
+
+if [ -d "$ARG" ] ; then 
+    ## Argument is a directory, collect files to convert 
+    if [ $# -gt 1 ] ; then 
+        echo "WARNING: multiple arguments given, only using files in $ARG !"
+    fi
+    DIR="$(cd "$ARG" ; /bin/pwd)"
+
+#    FILES=($(find . -maxdepth 2 -name '*.wiff' -exec  basename \{\} \; ))
+    FILES=($(find . -maxdepth 2 -name '*.raw' -exec  basename \{\} \; ))
+
+    SGEDIR="$DIR/SGE"
+    OUTDIR="$DIR/$SUFFIX"
+else 
+    i=0
+    for FILE in "$@" ; do
+        FILE=${FILE//\'/}
+        if [ ! -r "$FILE" ] ; then          
+            echo "WARNING: "$FILE" is not a readable file, exiting !"
+            exit 1;
+        fi
+#        if [ ! "${FILE:0:1}" = "/" ] ; then 
+#            # Add absolute path
+#            FILE="z:/data/$FILE"
+#        fi
+        FILES[q$i]="$FILE"
+        i=$(($i+1))
+    done 
+
+    SGEDIR="$PWD/SGE"
+    OUTDIR="$PWD/$SUFFIX"
+fi
+
+##
+## Restore space handling
+##
+IFS=$SAVEIFS
+
+mkdir -p -m 777 "$SGEDIR" 
+#if [ ! -w "$SGEDIR" ] ; then
+#    echo "$SGEDIR" is not writable. Exiting.
+#    exit;
+#fi
+
+mkdir -p -m 777 "$OUTDIR"
+#if [ ! -w "$OUTDIR" ] ; then
+#    echo "$OUTDIR" is not writable. Exiting.
+#    exit;
+#fi
+
+echo "Got ${#FILES[@]} files"
+echo Will convert into "$OUTDIR"
+echo Logfiles go into "$SGEDIR"
+
+mkdir -p mzML 
+
+for FILE in "${FILES[@]}" ; do
+  TMPMYWINEPREFIX=`mktemp -d /dev/shm/wineXXX`
+  singularity exec \
+    --cleanenv \
+    -B "$OUTDIR":/data \
+    -B $TMPMYWINEPREFIX:/mywineprefix \
+    --writable-tmpfs \
+    "$IMAGE" \
+    mywine msconvert \
+    --32 --zlib --filter "peakPicking true 1-" --filter "zeroSamples removeExtra" \
+    --outdir  z:/data/mzML \
+    "z:/data/$FILE"
+   sleep 2 ; rmdir $TMPMYWINEPREFIX
+done
